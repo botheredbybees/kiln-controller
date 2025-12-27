@@ -153,6 +153,19 @@ Best practices for development:
 - Test changes incrementally - modify one component at a time and verify it works before moving to the next change
 - Keep the browser console open to catch JavaScript errors immediately
 
+## Worked Example: Complete Feature Implementation
+
+For a detailed, step-by-step example of implementing a real feature from start to finish, see the [Delta Time Column Example](example-delta-time-feature.md). This guide walks through:
+
+- Identifying a user experience problem
+- Planning the solution
+- Implementing the code changes
+- Comprehensive testing
+- Creating a pull request
+- Responding to code review
+
+The example demonstrates adding a "Time Increment" column to the profile editor, making it easier to create and modify firing schedules without manual time calculations.
+
 ## Additional Resources
 
 For deeper understanding of the underlying technologies, consult these authoritative sources:
@@ -170,5 +183,6 @@ After becoming familiar with the basic structure:
 1. Start by making small visual changes to build confidence
 2. Experiment with modifying existing features before adding completely new ones
 3. Use the browser console to understand the data flow
-4. Refer to the existing code in `picoreflow.js` for patterns and examples
-5. Join the community discussions on the [GitHub repository](https://github.com/botheredbybees/kiln-controller) if you need help
+4. Work through the [complete example](example-delta-time-feature.md) to see the full development workflow
+5. Refer to the existing code in `picoreflow.js` for patterns and examples
+6. Join the community discussions on the [GitHub repository](https://github.com/botheredbybees/kiln-controller) if you need help
