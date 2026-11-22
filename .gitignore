@@ -16,3 +16,7 @@ db/*.db-wal
 db/*.db-shm
 venv/*
 kiln_controller.egg-info/
+# local secrets (Wi-Fi and account passwords for this kiln's Pi); never commit
+.env
+.env.*
+!.env.example

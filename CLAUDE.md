@@ -42,6 +42,7 @@ uv run python kiln-controller.py      # run the server
 - **Units.** The server works internally in Celsius, but every temperature in `config.py` is read in the `temp_scale` you choose, and the shipped values are Fahrenheit. Changing `temp_scale` without converting `emergency_shutoff_temp`, `emergency_heat_rate`, `pid_control_window` and the alert thresholds silently loosens the safety limits.
 - **Profile units.** A profile JSON without `"temp_units": "c"` is treated as Fahrenheit (`kiln-controller.py`, `normalize_temp_units`). Profile names must match `^[A-Za-z0-9._-]+$` and the file must be `<name>.json`.
 - **`config.py` is tracked and is also rewritten by the web UI** (`/api/config/editor`), so local edits on a Pi show up as a diff against upstream.
+- **`.env` holds secrets.** A `.env` in the repo root has the kiln Pi's Wi-Fi and account passwords. It is gitignored. Never print, log, commit or paste it; read a value only to use it, and never include one in a command line that is echoed.
 - **The shipped SPI pins** (`spi_sclk = D17`, `spi_miso = D27`, `spi_cs = D22`) are not this kiln's wiring; see `docs/my-kiln.md`.
 - **Display-scale settings.** `throttle_below_temp` and `throttle_percent` limit heating at low temperatures and are also in the display scale, so convert `throttle_below_temp` with the others.
 
