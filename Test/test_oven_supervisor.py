@@ -70,7 +70,7 @@ def quiet_oven(monkeypatch):
     monkeypatch.setattr(config, "supervisor_enabled", True)
     clock = FakeClock()
     monkeypatch.setattr(oven_module.time, "time", clock)
-    monkeypatch.setattr("lib.alerts.time.monotonic", clock)
+    monkeypatch.setattr(oven_module.time, "monotonic", clock)  # the supervisor's clock
     return clock
 
 
@@ -182,6 +182,44 @@ def test_supervisor_bad_setting_fails_open_once(monkeypatch, caplog, clock):
     assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1
 
 
+@pytest.mark.parametrize(
+    "setting, value",
+    [
+        ("supervisor_over_target_seconds", "120"),
+        ("supervisor_below_target_minutes", "10"),
+        ("supervisor_plateau_hold_minutes", "30"),
+        ("supervisor_over_target", True),
+    ],
+)
+def test_supervisor_bad_number_is_skipped_at_build_time_not_late(
+    monkeypatch, caplog, clock, setting, value
+):
+    # a bad setting must fail when the supervisor is built, once, never inside evaluate
+    # when a rule's condition finally holds (which would skip every later rule)
+    monkeypatch.setattr(config, setting, value)
+    oven, sink = make_oven(temp=TARGET_C + 60, heat=oven_heat_full())
+    with caplog.at_level(logging.ERROR, logger="lib.oven"):
+        for _ in range(200):
+            tick(oven, clock)
+    assert oven.state == "RUNNING"
+    assert oven._supervisor is None
+    assert sink.calls == []
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert setting in errors[0].getMessage()
+
+
+def test_supervisor_enabled_as_a_string_leaves_it_off(monkeypatch, caplog, clock):
+    monkeypatch.setattr(config, "supervisor_enabled", "False")  # truthy, but not True
+    oven, sink = make_oven(temp=TARGET_C + 60, heat=oven_heat_full())
+    with caplog.at_level(logging.ERROR, logger="lib.oven"):
+        for _ in range(200):
+            tick(oven, clock)
+    assert oven.state == "RUNNING"
+    assert oven._supervisor is None
+    assert sink.calls == []
+
+
 def test_supervisor_failure_never_raises_into_the_control_loop(monkeypatch, clock):
     oven, _ = make_oven()
     monkeypatch.setattr(oven, "_current_temp", lambda: 1 / 0)
@@ -247,9 +285,34 @@ def test_supervisor_sample_uses_profile_peak_and_duty(monkeypatch, clock):
     assert sample.target == 490.0
     assert sample.state == "RUNNING"
     assert sample.now == clock.now - 4.0
+    assert sample.catching_up is False
     assert sample.duty == pytest.approx(1.0 / oven.time_step)
     assert seen[1].duty == 1.0
     assert seen[2].duty == 0.0
+
+
+def test_supervisor_sample_carries_catching_up(monkeypatch, clock):
+    oven, _ = make_oven()
+    seen = []
+    monkeypatch.setattr(oven_module.Supervisor, "evaluate", lambda self, s: seen.append(s) or OK)
+    oven.catching_up = True
+    tick(oven, clock)
+    oven.catching_up = False
+    tick(oven, clock)
+    assert [s.catching_up for s in seen] == [True, False]
+
+
+def test_supervisor_time_is_monotonic_not_wall_clock(monkeypatch, clock):
+    # a step of the wall clock must not reach the supervisor's timers
+    oven, _ = make_oven()
+    seen = []
+    monkeypatch.setattr(oven_module.Supervisor, "evaluate", lambda self, s: seen.append(s) or OK)
+    wall = FakeClock(start=5_000_000.0)
+    monkeypatch.setattr(oven_module.time, "time", wall)
+    tick(oven, clock)
+    wall.advance(-3600)  # the wall clock steps back an hour
+    tick(oven, clock)
+    assert [s.now for s in seen] == [clock.now - 2.0, clock.now]
 
 
 def test_supervisor_skips_a_tick_when_the_temperature_is_unreadable(monkeypatch, clock):

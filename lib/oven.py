@@ -814,12 +814,13 @@ class Oven(threading.Thread):
             duty = self.heat / self.time_step if self.time_step > 0 else 0.0
             verdict = self._supervisor.evaluate(
                 Sample(
-                    now=time.time(),
+                    now=time.monotonic(),  # the supervisor only measures durations
                     temp=temp,
                     target=self.target,
                     duty=min(max(duty, 0.0), 1.0),
                     state=self.state,
                     peak=self._supervisor_peak,
+                    catching_up=self.catching_up,
                 )
             )
             if verdict.action == "plateau":
