@@ -141,6 +141,20 @@ def test_registry_entries_are_complete():
         assert a["description"] and isinstance(a["description"], str)
 
 
+def test_supervisor_alerts_sit_in_their_tiers():
+    by_id = {a["id"]: a for a in ALERTS}
+    ids = [a["id"] for a in ALERTS]
+    assert by_id["supervisor_stop"]["criticality"] == CRITICAL
+    assert by_id["supervisor_plateau"]["criticality"] == alerts_module.WARNING
+    assert ids.index("supervisor_stop") == ids.index("heat_rate_too_low") + 1
+    assert ids.index("supervisor_plateau") == ids.index("catch_up_stalled") + 1
+
+
+def test_relay_stuck_on_tells_the_operator_to_cut_the_power():
+    desc = {a["id"]: a for a in ALERTS}["relay_stuck_on"]["description"]
+    assert desc.endswith("If the kiln keeps heating, cut the power at the wall.")
+
+
 def test_registry_has_no_empty_tiers():
     tiers = {a["criticality"] for a in ALERTS}
     assert tiers == set(CRITICALITY_ORDER)

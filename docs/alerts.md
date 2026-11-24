@@ -20,7 +20,8 @@ Alerts come in three tiers, shown most critical first in the panel:
 | --- | --- | --- |
 | `emergency_shutoff` | Emergency shutoff fired | The kiln shut itself down because the emergency temperature limit was exceeded. |
 | `heat_rate_too_low` | Kiln not heating fast enough | The kiln fell too far behind its ramp and the run was aborted. Usually a failed element or a relay stuck open. |
-| `relay_stuck_on` | Relay stuck on | Elements commanded off but temperature keeps climbing -- the relay may be welded closed. |
+| `supervisor_stop` | Supervisor stopped the firing | The firing supervisor stopped the run because the kiln was behaving in a way that looks unsafe, such as running far above its target or heating with no rise in temperature. |
+| `relay_stuck_on` | Relay stuck on | Elements commanded off but temperature keeps climbing -- the relay may be welded closed. If the kiln keeps heating, cut the power at the wall. |
 | `tc_failure` | Thermocouple failure | Lost thermocouple connection, a short circuit, an out-of-range cold junction, or too many read errors in a row. |
 | `temp_implausible` | Implausible temperature reading | A reading jumped or flatlined in a way that suggests a failing sensor or loose wiring. |
 
@@ -32,6 +33,7 @@ Alerts come in three tiers, shown most critical first in the panel:
 | `restart_resumed` | Firing resumed after power outage | The controller restarted after an outage and resumed the run automatically. |
 | `restart_not_resumed` | Run not resumed after power outage | Power was out longer than the automatic restart window, so the firing did not resume and needs attention. |
 | `catch_up_stalled` | Kiln falling behind schedule | The kiln has been unable to keep up with its target temperature for an extended period. |
+| `supervisor_plateau` | Kiln stalled below target | The kiln has stopped gaining temperature at full power below its target. The supervisor will stop the firing if it does not recover. |
 | `scheduled_run_missed` | Scheduled run missed | A scheduled firing could not start when its time arrived. |
 
 ### Info -- normal lifecycle worth knowing about
@@ -77,6 +79,7 @@ deltas are in your display scale:
 | temp_implausible | `temp_implausible_jump` | 50 -- impossible change between two readings |
 | tc_failure | `tc_error_percent_limit` | 30 -- percent of failed reads per window |
 | catch_up_stalled | `catch_up_stalled_minutes` | 15 -- minutes behind schedule before alerting |
+| supervisor_stop, supervisor_plateau | `supervisor_enabled` and the other `supervisor_*` settings | off by default; each rule is a number in `config.py` and 0 turns it off |
 
 Delivery
 --------

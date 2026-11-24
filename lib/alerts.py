@@ -37,9 +37,15 @@ ALERTS = [
         "criticality": CRITICAL,
     },
     {
+        "id": "supervisor_stop",
+        "label": "Supervisor stopped the firing",
+        "description": "The firing supervisor stopped the run because the kiln was behaving in a way that looks unsafe, such as running far above its target or heating with no rise in temperature.",
+        "criticality": CRITICAL,
+    },
+    {
         "id": "relay_stuck_on",
         "label": "Relay stuck on",
-        "description": "The elements are commanded off but the temperature keeps climbing, which means the relay may be welded closed.",
+        "description": "The elements are commanded off but the temperature keeps climbing, which means the relay may be welded closed. If the kiln keeps heating, cut the power at the wall.",
         "criticality": CRITICAL,
     },
     {
@@ -77,6 +83,12 @@ ALERTS = [
         "id": "catch_up_stalled",
         "label": "Kiln falling behind schedule",
         "description": "The kiln has been unable to keep up with its target temperature for an extended period.",
+        "criticality": WARNING,
+    },
+    {
+        "id": "supervisor_plateau",
+        "label": "Kiln stalled below target",
+        "description": "The kiln has stopped gaining temperature at full power below its target. The supervisor will stop the firing if it does not recover.",
         "criticality": WARNING,
     },
     {

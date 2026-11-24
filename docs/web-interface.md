@@ -187,6 +187,9 @@ Detection thresholds live in the alerts section of `config.py`
 (`cooled_safe_temp`, `relay_stuck_on_rise`, `relay_stuck_on_window`,
 `temp_implausible_jump`, `catch_up_stalled_minutes`).
 
+The firing supervisor's `supervisor_*` settings are in their own block of `config.py`
+and are described in [Firing Supervisor](supervisor.md).
+
 ### PID Auto-Tuner
 
 At the bottom of the Config tab, the **PID Auto-Tuner** calculates optimal PID

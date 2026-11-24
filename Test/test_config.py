@@ -60,3 +60,24 @@ def test_alert_thresholds():
 
 def test_profiles_directory_points_at_storage():
     assert config.kiln_profiles_directory.endswith("storage" + config.os.sep + "profiles")
+
+
+def test_supervisor_settings_ship_off_and_in_display_scale():
+    """the supervisor is off by default. each delta is in the display scale
+    (the repo ships in F), 0 turns a rule off."""
+    assert config.supervisor_enabled is False
+    assert config.supervisor_peak_margin == 54  # 30 C
+    assert config.supervisor_over_target_heater_on == 18  # 10 C
+    assert config.supervisor_over_target_heater_on_seconds == 20
+    assert config.supervisor_over_target == 45  # 25 C
+    assert config.supervisor_over_target_seconds == 120
+    assert config.supervisor_below_target == 72  # 40 C
+    assert config.supervisor_below_target_minutes == 10
+    assert config.supervisor_max_rise_per_minute == 54  # 30 C/min
+    assert config.supervisor_stuck_minutes == 12
+    assert config.supervisor_stuck_rise == 11  # 6 C
+    assert config.supervisor_no_rise_minutes == 10
+    assert config.supervisor_no_rise_gain == 5  # 3 C
+    assert config.supervisor_plateau_minutes == 20
+    assert config.supervisor_plateau_gain == 9  # 5 C
+    assert config.supervisor_plateau_hold_minutes == 30
