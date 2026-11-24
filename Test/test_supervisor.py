@@ -264,3 +264,102 @@ def test_heater_and_rate_rules_are_off_when_zero():
     rows += _slow_rise_rows(7)
     rows += _no_rise_rows(lambda t: 300.0, 700)
     assert all(v == OK for v in run(sup, rows))
+
+
+def _flat_rows(start, stop, temp=864.0, target=870.0, duty=1.0, step=2):
+    return [sample(t, temp, target, duty=duty) for t in range(start, stop, step)]
+
+
+def _first_index(verdicts, action):
+    return next((i for i, v in enumerate(verdicts) if v.action == action), None)
+
+
+def test_plateau_detected_after_20_minutes_at_full_power():
+    sup = make()
+    verdicts = run(sup, _flat_rows(0, 1700))
+    plateaus = [i * 2 for i, v in enumerate(verdicts) if v.action == "plateau"]
+    assert len(plateaus) == 1
+    assert 1140 <= plateaus[0] <= 1200
+    assert verdicts[_first_index(verdicts, "plateau")].rule == "plateau"
+    assert all(v.action != "stop" for v in verdicts)
+
+
+def test_plateau_stops_after_the_hold():
+    sup = make()
+    verdicts = run(sup, _flat_rows(0, 3200))
+    detected = _first_index(verdicts, "plateau") * 2
+    stop = _first_index(verdicts, "stop") * 2
+    assert stop == detected + 1800
+    assert verdicts[stop // 2].rule == "plateau"
+    assert all(v.action == "ok" for v in verdicts[detected // 2 + 1 : stop // 2])
+
+
+def test_plateau_clears_when_the_kiln_gains_5_c():
+    # flat at 864 C, then a 6 C gain at t=1500, well before the 30 minute hold ends
+    sup = make()
+    rows = _flat_rows(0, 1500, target=880) + _flat_rows(1500, 3100, temp=870.0, target=880)
+    verdicts = run(sup, rows)
+    assert all(v.action != "stop" for v in verdicts)
+    plateaus = [i * 2 for i, v in enumerate(verdicts) if v.action == "plateau"]
+    assert len(plateaus) == 2  # reported again for the second plateau
+    assert 1140 <= plateaus[0] <= 1200
+    assert plateaus[1] > 1500 + 1140  # only once the gain has left the window
+
+
+def test_not_a_plateau_when_close_to_target():
+    sup = make()
+    assert all(v == OK for v in run(sup, _flat_rows(0, 3600, temp=868.0)))
+
+
+def test_not_a_plateau_at_low_duty():
+    sup = make()
+    assert all(v == OK for v in run(sup, _flat_rows(0, 3600, temp=850.0, duty=0.5)))
+
+
+def test_first_sample_at_full_duty_is_harmless():
+    # the PID has not settled: the first sample reads 2.0 s of 2 s, then a normal ramp
+    sup = make()
+    rows = [sample(0, 20.0, 20.0, duty=1.0)]
+    rows += [sample(t, 20 + 0.1 * t, 20 + 0.1 * t + 10, duty=0.6) for t in range(2, 2400, 2)]
+    assert all(v == OK for v in run(sup, rows))
+
+
+def test_low_glitch_does_not_create_a_plateau():
+    # a slow climb (10 C in 20 minutes at full power, 20 C under target); a three-sample
+    # low reading must not look like a stall
+    sup = make()
+    rows = []
+    for t in range(0, 2400, 2):
+        temp = 700 + t / 120
+        shown = 2.85 if 1500 <= t <= 1504 else temp
+        rows.append(sample(t, shown, temp + 20, duty=1.0))
+    assert all(v == OK for v in run(sup, rows))
+
+
+def test_high_glitch_does_not_clear_a_plateau():
+    sup = make()
+    rows = _flat_rows(0, 1900)
+    rows += [sample(t, 1170.0, 870.0, duty=1.0, peak=2000.0) for t in (1900, 1902, 1904)]
+    rows += _flat_rows(1906, 3200)
+    verdicts = run(sup, rows)
+    assert [v.action for v in verdicts].count("plateau") == 1
+    assert verdicts[_first_index(verdicts, "stop")].rule == "plateau"
+
+
+def test_clock_stepping_backwards_resets_windows():
+    sup = make()
+    start = 10000
+    assert all(v == OK for v in run(sup, [sample(start + t, 800, 805, duty=1.0) for t in range(600)]))
+    # 15 s of 12 C over with the heater on; the timer is running
+    assert all(v == OK for v in run(sup, [sample(start + 600 + t, 812, 800, duty=0.5) for t in range(15)]))
+    back = start + 600 - 3600
+    assert sup.evaluate(sample(back, 812, 800, duty=0.5)) == OK
+    # the 20 s timer starts again from the sample after the step
+    verdicts = run(sup, [sample(back + t, 812, 800, duty=0.5) for t in range(1, 21)])
+    assert all(v == OK for v in verdicts)
+    assert sup.evaluate(sample(back + 21, 812, 800, duty=0.5)).rule == "over_target_heater_on"
+
+
+def test_plateau_is_off_when_the_window_is_zero():
+    sup = make(plateau_window_s=0)
+    assert all(v == OK for v in run(sup, _flat_rows(0, 3600)))

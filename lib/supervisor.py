@@ -8,6 +8,11 @@ A rule that says "for N seconds" starts a timer at the first sample over its lim
 trips when a later sample is still over the limit more than N seconds on. The ceiling
 rule needs CONSECUTIVE samples in a row.
 
+The plateau rule is different: when it first sees the kiln stalled it returns a "plateau"
+verdict once, and only stops the firing if the stall lasts a further plateau_hold_s.
+A sample whose time is earlier than the one before it (the clock stepped back) clears
+every window and timer, and the sample then starts them afresh.
+
 The heater-off rule trips at 720 s or more (the monitor script's behaviour); the other
 timer rules trip strictly after their time.
 
@@ -25,6 +30,8 @@ RATE_MIN_SAMPLES = 6  # and needs at least this many samples ...
 RATE_MIN_SPAN_S = 30.0  # ... spanning at least this long
 STUCK_LOOKBACK_S = 390.0  # sample history kept for the heater-off rule (it looks 360 s back)
 STUCK_RISE_WINDOW_S = 360.0  # the heater-off rule compares with a sample at least this old
+PLATEAU_LOOKBACK_EXTRA_S = 30.0  # the plateau window keeps this much more than its length
+PLATEAU_WINDOW_FRACTION = 0.95  # the window counts as full once it spans this much of its length
 GLITCH_JUMP_C = 100.0  # a reading this far from the last good one is a glitch ...
 GLITCH_MAX_SAMPLES = 3  # ... for at most this many samples in a row, then it is believed
 
@@ -86,6 +93,7 @@ class Supervisor:
         self.target_hist = []  # (time, target), last TARGET_WINDOW_S
         self.heat_hist = deque()  # (time, temp) while the heater is on, last HEAT_WINDOW_S
         self.sample_hist = deque()  # (time, temp), last STUCK_LOOKBACK_S
+        self.plateau_hist = deque()  # (time, temp, duty), last plateau_window_s plus a little
         self.last_now = None
         self.last_temp = None  # the last reading that was not a glitch
         self.glitch_count = 0
@@ -94,6 +102,8 @@ class Supervisor:
         self.heat_time = 0.0  # seconds of heater-on time while the target was rising
 
     def evaluate(self, s: Sample) -> Verdict:
+        if self.last_now is not None and s.now < self.last_now:
+            self.reset()  # the clock stepped back: no window or timer means anything now
         if s.state != self.last_state:
             self.reset()
             self.last_state = s.state
@@ -106,6 +116,7 @@ class Supervisor:
             self._rise_rate,
             self._no_rise,
             self._heater_off_rising,
+            self._plateau,
         ):
             verdict = rule(s)
             if verdict is not None:
@@ -136,6 +147,8 @@ class Supervisor:
             self._prune(self.heat_hist, s.now, HEAT_WINDOW_S)
         self.sample_hist.append((s.now, s.temp))
         self._prune(self.sample_hist, s.now, STUCK_LOOKBACK_S)
+        self.plateau_hist.append((s.now, s.temp, s.duty))
+        self._prune(self.plateau_hist, s.now, self.cfg.plateau_window_s + PLATEAU_LOOKBACK_EXTRA_S)
 
     @staticmethod
     def _prune(hist, now: float, window_s: float) -> None:
@@ -156,6 +169,7 @@ class Supervisor:
         if jump:  # the kiln really moved: nothing measured before it compares with now
             self.heat_hist.clear()
             self.sample_hist.clear()
+            self.plateau_hist.clear()
             self.start_temp = None
             self.heat_time = 0.0
         self.last_temp = s.temp
@@ -290,3 +304,41 @@ class Supervisor:
             "the last %.0f min (now %.1f C); cut the power at the wall"
             % (held / 60, s.temp - past, STUCK_RISE_WINDOW_S / 60, s.temp),
         )
+
+    def _plateau(self, s: Sample):
+        """Long stretch at near full power with no gain while still below the target. The first
+        sample that sees it returns a "plateau" verdict; it stops only if it lasts the hold."""
+        window = self.cfg.plateau_window_s
+        hist = self.plateau_hist
+        if window <= 0 or self.glitch:  # a glitch neither starts nor clears a plateau
+            return None
+        mean_duty = sum(duty for _, _, duty in hist) / len(hist)
+        gain = s.temp - hist[0][1]
+        stalled = (
+            s.state == "RUNNING"
+            and s.temp < s.target - self.cfg.plateau_min_below_target
+            and s.now - hist[0][0] >= window * PLATEAU_WINDOW_FRACTION
+            and mean_duty >= self.cfg.plateau_min_duty
+            and gain < self.cfg.plateau_gain
+        )
+        first = "plateau" not in self.since
+        held = self._held("plateau", stalled, s.now)
+        if held is None:
+            return None
+        if first:
+            return Verdict(
+                "plateau",
+                "plateau",
+                "the kiln may not reach the target: %.1f C vs %.1f C after %.0f min at %.0f%% "
+                "output with a gain of %.1f C"
+                % (s.temp, s.target, (s.now - hist[0][0]) / 60, mean_duty * 100, gain),
+            )
+        if held >= self.cfg.plateau_hold_s:
+            return Verdict(
+                "stop",
+                "plateau",
+                "the kiln cannot reach the target: %.1f C vs %.1f C, still stalled %.0f min after "
+                "it was reported (%.0f%% output, gain %.1f C)"
+                % (s.temp, s.target, held / 60, mean_duty * 100, gain),
+            )
+        return None
