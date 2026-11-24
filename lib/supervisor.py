@@ -11,11 +11,19 @@ rule needs CONSECUTIVE samples in a row.
 Every rule is disabled by setting its main number to 0.
 """
 
+from collections import deque
 from dataclasses import dataclass
 
 CONSECUTIVE = 2  # samples in a row for the ceiling rule
 TARGET_WINDOW_S = 60.0  # how far back the target is compared to see it rise or fall
 TARGET_MOVE_C = 0.1  # the target counts as rising or falling when it moved more than this
+HEAT_WINDOW_S = 60.0  # the rise rate is measured over this long a stretch of heating
+RATE_MIN_SAMPLES = 6  # and needs at least this many samples ...
+RATE_MIN_SPAN_S = 30.0  # ... spanning at least this long
+STUCK_LOOKBACK_S = 390.0  # sample history kept for the heater-off rule (it looks 360 s back)
+STUCK_RISE_WINDOW_S = 360.0  # the heater-off rule compares with a sample at least this old
+GLITCH_JUMP_C = 100.0  # a reading this far from the last good one is a glitch ...
+GLITCH_MAX_SAMPLES = 3  # ... for at most this many samples in a row, then it is believed
 
 
 @dataclass(frozen=True)
@@ -71,30 +79,91 @@ class Supervisor:
     def reset(self) -> None:
         """Clear every window and timer."""
         self.peak_count = 0
-        self.over_heat_since = None
-        self.over_any_since = None
-        self.below_since = None
+        self.since = {}  # rule -> time its condition started holding
         self.target_hist = []  # (time, target), last TARGET_WINDOW_S
+        self.heat_hist = deque()  # (time, temp) while the heater is on, last HEAT_WINDOW_S
+        self.sample_hist = deque()  # (time, temp), last STUCK_LOOKBACK_S
+        self.last_now = None
+        self.last_temp = None  # the last reading that was not a glitch
+        self.glitch_count = 0
+        self.glitch = False  # the current sample is a glitch
+        self.start_temp = None  # temperature of the first good sample, for the no-rise rule
+        self.heat_time = 0.0  # seconds of heater-on time while the target was rising
 
     def evaluate(self, s: Sample) -> Verdict:
         if s.state != self.last_state:
             self.reset()
             self.last_state = s.state
-        self._record_target(s)
+        self._record(s)
         for rule in (
             self._peak_ceiling,
             self._over_target_heater_on,
             self._over_target,
             self._below_target,
+            self._rise_rate,
+            self._no_rise,
+            self._heater_off_rising,
         ):
             verdict = rule(s)
             if verdict is not None:
                 return verdict
         return OK
 
+    def _held(self, key: str, active: bool, now: float):
+        """Seconds the condition has held without a break, or None while it does not hold."""
+        if not active:
+            self.since.pop(key, None)
+            return None
+        return now - self.since.setdefault(key, now)
+
+    def _record(self, s: Sample) -> None:
+        self._record_target(s)
+        dt = 0.0 if self.last_now is None else s.now - self.last_now
+        self.last_now = s.now
+        self._classify(s)
+        heating = s.duty > 0
+        if heating and self._target_rising(s):
+            self.heat_time += dt
+        if not heating:
+            self.heat_hist.clear()
+        if self.glitch:
+            return
+        if heating:
+            self.heat_hist.append((s.now, s.temp))
+            self._prune(self.heat_hist, s.now, HEAT_WINDOW_S)
+        self.sample_hist.append((s.now, s.temp))
+        self._prune(self.sample_hist, s.now, STUCK_LOOKBACK_S)
+
+    @staticmethod
+    def _prune(hist, now: float, window_s: float) -> None:
+        while hist and now - hist[0][0] > window_s:
+            hist.popleft()
+
+    def _classify(self, s: Sample) -> None:
+        """Flag a reading that jumps far from the last good one (seen once on the real kiln:
+        600 C read 2.85 C for three samples). Rates, gains and the below-target rule ignore
+        a glitch, but only a few in a row: a reading that stays put is believed."""
+        jump = self.last_temp is not None and abs(s.temp - self.last_temp) > GLITCH_JUMP_C
+        if jump and self.glitch_count < GLITCH_MAX_SAMPLES:
+            self.glitch_count += 1
+            self.glitch = True
+            return
+        self.glitch = False
+        self.glitch_count = 0
+        if jump:  # the kiln really moved: nothing measured before it compares with now
+            self.heat_hist.clear()
+            self.sample_hist.clear()
+            self.start_temp = None
+        self.last_temp = s.temp
+        if self.start_temp is None:
+            self.start_temp = s.temp
+
     def _record_target(self, s: Sample) -> None:
         self.target_hist.append((s.now, s.target))
         self.target_hist = [(t, x) for t, x in self.target_hist if s.now - t <= TARGET_WINDOW_S]
+
+    def _target_rising(self, s: Sample) -> bool:
+        return len(self.target_hist) > 1 and s.target - self.target_hist[0][1] > TARGET_MOVE_C
 
     def _target_falling(self, s: Sample) -> bool:
         return len(self.target_hist) > 1 and self.target_hist[0][1] - s.target > TARGET_MOVE_C
@@ -126,13 +195,8 @@ class Supervisor:
             and s.temp > s.target + limit
             and not self._skip_over_target(s)
         )
-        if not over:
-            self.over_heat_since = None
-            return None
-        if self.over_heat_since is None:
-            self.over_heat_since = s.now
-        held = s.now - self.over_heat_since
-        if held > self.cfg.over_target_heater_on_s:
+        held = self._held("over_target_heater_on", over, s.now)
+        if held is not None and held > self.cfg.over_target_heater_on_s:
             return Verdict(
                 "stop",
                 "over_target_heater_on",
@@ -149,13 +213,8 @@ class Supervisor:
             and s.temp > s.target + limit
             and not self._skip_over_target(s)
         )
-        if not over:
-            self.over_any_since = None
-            return None
-        if self.over_any_since is None:
-            self.over_any_since = s.now
-        held = s.now - self.over_any_since
-        if held > self.cfg.over_target_s:
+        held = self._held("over_target", over, s.now)
+        if held is not None and held > self.cfg.over_target_s:
             return Verdict(
                 "stop",
                 "over_target",
@@ -166,14 +225,11 @@ class Supervisor:
 
     def _below_target(self, s: Sample):
         limit = self.cfg.below_target
-        below = limit > 0 and s.state == "RUNNING" and s.temp < s.target - limit
-        if not below:
-            self.below_since = None
+        if self.glitch:  # a glitch neither starts nor clears the timer
             return None
-        if self.below_since is None:
-            self.below_since = s.now
-        held = s.now - self.below_since
-        if held > self.cfg.below_target_s:
+        below = limit > 0 and s.state == "RUNNING" and s.temp < s.target - limit
+        held = self._held("below_target", below, s.now)
+        if held is not None and held > self.cfg.below_target_s:
             return Verdict(
                 "stop",
                 "below_target",
@@ -181,3 +237,52 @@ class Supervisor:
                 "not following the profile" % (s.temp, limit, s.target, held),
             )
         return None
+
+    def _rise_rate(self, s: Sample):
+        limit = self.cfg.max_rise_per_minute
+        hist = self.heat_hist
+        if limit <= 0 or len(hist) < RATE_MIN_SAMPLES or self.glitch:
+            return None
+        span = hist[-1][0] - hist[0][0]
+        if span < RATE_MIN_SPAN_S:
+            return None
+        rate = (hist[-1][1] - hist[0][1]) / (span / 60)
+        if rate > limit:
+            return Verdict(
+                "stop",
+                "rise_rate",
+                "rising too fast while heating: %.1f C/min (limit %.0f C/min)" % (rate, limit),
+            )
+        return None
+
+    def _no_rise(self, s: Sample):
+        if self.cfg.no_rise_s <= 0 or self.glitch or self.start_temp is None:
+            return None
+        gain = s.temp - self.start_temp
+        if self.heat_time > self.cfg.no_rise_s and gain < self.cfg.no_rise_gain:
+            return Verdict(
+                "stop",
+                "no_rise",
+                "no temperature rise after %.0f s of heating (%.2f C)" % (self.heat_time, gain),
+            )
+        return None
+
+    def _heater_off_rising(self, s: Sample):
+        limit = self.cfg.stuck_s
+        held = self._held("heater_off", limit > 0 and s.duty <= 0.001, s.now)
+        if held is None or held < limit or self.glitch:
+            return None
+        past = None  # the newest sample at least STUCK_RISE_WINDOW_S old
+        for t, temp in self.sample_hist:
+            if s.now - t < STUCK_RISE_WINDOW_S:
+                break
+            past = temp
+        if past is None or s.temp - past < self.cfg.stuck_rise:
+            return None
+        return Verdict(
+            "stop",
+            "heater_off_rising",
+            "heater may be stuck on: output 0 for %.0f min yet the temperature rose %.1f C in "
+            "the last %.0f min (now %.1f C); cut the power at the wall"
+            % (held / 60, s.temp - past, STUCK_RISE_WINDOW_S / 60, s.temp),
+        )
