@@ -9,7 +9,13 @@ trips when a later sample is still over the limit more than N seconds on. The ce
 rule needs CONSECUTIVE samples in a row.
 
 The plateau rule is different: when it first sees the kiln stalled it returns a "plateau"
-verdict once, and only stops the firing if the stall lasts a further plateau_hold_s.
+verdict once, and stops the firing plateau_hold_s after that. The hold survives a lapse of
+up to PLATEAU_LAPSE_S in the stall condition (a reading flickering across the margin, a dip
+in mean duty). It clears only when the kiln gains plateau_gain over the window, when the
+stall has been absent for longer than PLATEAU_LAPSE_S, or on reset(); a later stall then
+reports "plateau" again. It stops at or after the hold (>=), where the other timer rules
+trip strictly after their time; with plateau_hold_s = 0 it stops on the sample after
+detection.
 A sample whose time is earlier than the one before it (the clock stepped back) clears
 every window and timer, and the sample then starts them afresh.
 
@@ -32,6 +38,7 @@ STUCK_LOOKBACK_S = 390.0  # sample history kept for the heater-off rule (it look
 STUCK_RISE_WINDOW_S = 360.0  # the heater-off rule compares with a sample at least this old
 PLATEAU_LOOKBACK_EXTRA_S = 30.0  # the plateau window keeps this much more than its length
 PLATEAU_WINDOW_FRACTION = 0.95  # the window counts as full once it spans this much of its length
+PLATEAU_LAPSE_S = 120.0  # a plateau is forgotten once the stall has been absent this long
 GLITCH_JUMP_C = 100.0  # a reading this far from the last good one is a glitch ...
 GLITCH_MAX_SAMPLES = 3  # ... for at most this many samples in a row, then it is believed
 
@@ -94,6 +101,8 @@ class Supervisor:
         self.heat_hist = deque()  # (time, temp) while the heater is on, last HEAT_WINDOW_S
         self.sample_hist = deque()  # (time, temp), last STUCK_LOOKBACK_S
         self.plateau_hist = deque()  # (time, temp, duty), last plateau_window_s plus a little
+        self.plateau_at = None  # when the current plateau was reported
+        self.plateau_lapse_at = None  # when the stall condition last stopped holding
         self.last_now = None
         self.last_temp = None  # the last reading that was not a glitch
         self.glitch_count = 0
@@ -170,6 +179,7 @@ class Supervisor:
             self.heat_hist.clear()
             self.sample_hist.clear()
             self.plateau_hist.clear()
+            self._clear_plateau()
             self.start_temp = None
             self.heat_time = 0.0
         self.last_temp = s.temp
@@ -321,11 +331,12 @@ class Supervisor:
             and mean_duty >= self.cfg.plateau_min_duty
             and gain < self.cfg.plateau_gain
         )
-        first = "plateau" not in self.since
-        held = self._held("plateau", stalled, s.now)
-        if held is None:
-            return None
-        if first:
+        if self.plateau_at is not None and gain >= self.cfg.plateau_gain:
+            self._clear_plateau()  # the kiln really moved
+        if self.plateau_at is None:
+            if not stalled:
+                return None
+            self.plateau_at = s.now
             return Verdict(
                 "plateau",
                 "plateau",
@@ -333,6 +344,14 @@ class Supervisor:
                 "output with a gain of %.1f C"
                 % (s.temp, s.target, (s.now - hist[0][0]) / 60, mean_duty * 100, gain),
             )
+        if stalled:
+            self.plateau_lapse_at = None
+        else:
+            self.plateau_lapse_at = s.now if self.plateau_lapse_at is None else self.plateau_lapse_at
+            if s.now - self.plateau_lapse_at > PLATEAU_LAPSE_S:
+                self._clear_plateau()
+                return None
+        held = s.now - self.plateau_at
         if held >= self.cfg.plateau_hold_s:
             return Verdict(
                 "stop",
@@ -342,3 +361,7 @@ class Supervisor:
                 % (s.temp, s.target, held / 60, mean_duty * 100, gain),
             )
         return None
+
+    def _clear_plateau(self) -> None:
+        self.plateau_at = None
+        self.plateau_lapse_at = None

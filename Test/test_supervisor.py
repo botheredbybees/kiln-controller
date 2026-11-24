@@ -363,3 +363,46 @@ def test_clock_stepping_backwards_resets_windows():
 def test_plateau_is_off_when_the_window_is_zero():
     sup = make(plateau_window_s=0)
     assert all(v == OK for v in run(sup, _flat_rows(0, 3600)))
+
+
+def _stop_times(verdicts, step=2):
+    return [i * step for i, v in enumerate(verdicts) if v.action == "stop"]
+
+
+def test_plateau_hold_survives_flicker_across_the_margin():
+    # after detection the reading flickers across target - 4 C every sample
+    sup = make()
+    rows = _flat_rows(0, 1200)
+    rows += [
+        sample(t, 866.0 if t % 4 == 0 else 865.9, 870.0, duty=1.0) for t in range(1200, 3200, 2)
+    ]
+    verdicts = run(sup, rows)
+    assert [v.action for v in verdicts].count("plateau") == 1
+    assert _stop_times(verdicts)[0] == 1140 + 1800
+    assert verdicts[(1140 + 1800) // 2].rule == "plateau"
+
+
+def test_plateau_hold_survives_a_short_dip_in_mean_duty():
+    # mean duty sits just over 0.9; six samples at 0.85 push it just under for a few
+    # samples, then three at full power bring it back
+    sup = make()
+    rows = _flat_rows(0, 1200, duty=0.9005)
+    for t in range(1200, 3200, 2):
+        duty = 0.85 if 1200 <= t < 1212 else (1.0 if t < 1218 else 0.9005)
+        rows.append(sample(t, 864.0, 870.0, duty=duty))
+    verdicts = run(sup, rows)
+    assert [v.action for v in verdicts].count("plateau") == 1
+    assert _stop_times(verdicts)[0] == 1140 + 1800
+
+
+def test_plateau_hold_restarts_after_a_real_recovery():
+    # 131 s within 3 C of the target (longer than the 120 s lapse), then stalled again
+    sup = make()
+    rows = _flat_rows(0, 1500)
+    rows += _flat_rows(1500, 1632, temp=867.0)
+    rows += _flat_rows(1632, 3600)
+    verdicts = run(sup, rows)
+    plateaus = [i * 2 for i, v in enumerate(verdicts) if v.action == "plateau"]
+    assert plateaus == [1140, 1632]
+    assert _stop_times(verdicts) == [1632 + 1800 + 2 * k for k in range(len(_stop_times(verdicts)))]
+    assert _stop_times(verdicts)[0] == 1632 + 1800
