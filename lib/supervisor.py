@@ -15,9 +15,14 @@ verdict once, and stops the firing plateau_hold_s after that. The hold survives 
 up to PLATEAU_LAPSE_S in the stall condition (a reading flickering across the margin, a dip
 in mean duty). It clears only when the kiln gains plateau_gain over the window, when the
 stall has been absent for longer than PLATEAU_LAPSE_S, or on reset(); a later stall then
-reports "plateau" again. It stops at or after the hold (>=), where the other timer rules
-trip strictly after their time; with plateau_hold_s = 0 it stops on the sample after
-detection.
+reports "plateau" again. It stops at or after the hold (>=), on a sample that is itself
+stalled, where the other timer rules trip strictly after their time; with plateau_hold_s = 0
+it stops on the sample after detection. While Sample.catching_up is set, a kiln anywhere below
+the target counts as below it, because the controller freezes the schedule one PID window
+behind the kiln.
+A glitch sample leaves the over-target timers and the ceiling count as they are. The
+over_target rule (heater on or off) does not count a kiln whose heater is off and which has
+fallen over the last minute: it is cooling toward a frozen target, and stopping achieves nothing.
 A sample whose time is earlier than the one before it (the clock stepped back) clears
 every window and timer, and the sample then starts them afresh.
 
@@ -27,6 +32,7 @@ timer rules trip strictly after their time.
 Every rule is disabled by setting its main number to 0.
 """
 
+import math
 from collections import deque
 from dataclasses import dataclass
 
@@ -41,6 +47,8 @@ STUCK_RISE_WINDOW_S = 360.0  # the heater-off rule compares with a sample at lea
 PLATEAU_LOOKBACK_EXTRA_S = 30.0  # the plateau window keeps this much more than its length
 PLATEAU_WINDOW_FRACTION = 0.95  # the window counts as full once it spans this much of its length
 PLATEAU_LAPSE_S = 120.0  # a plateau is forgotten once the stall has been absent this long
+FALLING_WINDOW_S = 60.0  # the kiln counts as cooling when it is lower than this long ago ...
+FALLING_MIN_C = 0.1  # ... by more than this (the over-target rule ignores a cooling kiln)
 GLITCH_JUMP_C = 100.0  # a reading this far from the last good one is a glitch ...
 GLITCH_MAX_SAMPLES = 3  # ... for at most this many samples in a row, then it is believed
 
@@ -53,6 +61,7 @@ class Sample:
     duty: float  # 0 to 1
     state: str  # "RUNNING" or "PAUSED"
     peak: float  # C, highest point of the running profile
+    catching_up: bool = False  # the controller has frozen the schedule to let the kiln catch up
 
 
 @dataclass(frozen=True)
@@ -96,15 +105,24 @@ class SupervisorConfig:
         here; minutes become seconds. A setting an older config.py does not have keeps the
         script value, so this reads every setting with getattr and never raises for a missing one.
         """
-        if not getattr(cfg, "supervisor_enabled", False):
-            return None
+        if getattr(cfg, "supervisor_enabled", False) is not True:
+            return None  # only a real True turns it on: the string "False" is truthy
         from temp import delta_to_c  # lazy: lib.temp reads config, this module stays pure
 
         d = cls()
 
+        def number(name, value):
+            # a quoted number or a bool would build and then fail (or misbehave) mid-run, so
+            # every numeric setting is checked here, where the oven's fail-open catch logs it
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError("supervisor_%s must be a number, not %r" % (name, value))
+            if not math.isfinite(value):
+                raise ValueError("supervisor_%s must be a finite number" % name)
+            return float(value)
+
         def read(name, default, convert=lambda v: v):
             value = getattr(cfg, "supervisor_" + name, None)
-            return default if value is None else convert(value)
+            return default if value is None else convert(number(name, value))
 
         def delta(name, default):
             return read(name, default, delta_to_c)
@@ -130,7 +148,7 @@ class SupervisorConfig:
             plateau_window_s=minutes("plateau_minutes", d.plateau_window_s),
             plateau_gain=delta("plateau_gain", d.plateau_gain),
             plateau_hold_s=minutes("plateau_hold_minutes", d.plateau_hold_s),
-            catch_up_enabled=getattr(cfg, "kiln_must_catch_up", True),
+            catch_up_enabled=bool(getattr(cfg, "kiln_must_catch_up", True)),
         )
 
 
@@ -233,6 +251,15 @@ class Supervisor:
         if self.start_temp is None:
             self.start_temp = s.temp
 
+    def _past_temp(self, now: float, age_s: float):
+        """The reading of the newest good sample at least age_s old, or None."""
+        past = None
+        for t, temp in self.sample_hist:
+            if now - t < age_s:
+                break
+            past = temp
+        return past
+
     def _record_target(self, s: Sample) -> None:
         self.target_hist.append((s.now, s.target))
         self.target_hist = [(t, x) for t, x in self.target_hist if s.now - t <= TARGET_WINDOW_S]
@@ -249,6 +276,8 @@ class Supervisor:
         return not self.cfg.catch_up_enabled and self._target_falling(s)
 
     def _peak_ceiling(self, s: Sample):
+        if self.glitch:  # a glitch neither adds to the count nor clears it
+            return None
         margin = self.cfg.peak_margin
         over = margin > 0 and s.temp > s.peak + margin
         self.peak_count = self.peak_count + 1 if over else 0
@@ -262,6 +291,8 @@ class Supervisor:
         return None
 
     def _over_target_heater_on(self, s: Sample):
+        if self.glitch:  # a glitch neither starts nor clears the timer
+            return None
         limit = self.cfg.over_target_heater_on
         over = (
             limit > 0
@@ -280,13 +311,26 @@ class Supervisor:
             )
         return None
 
+    def _cooling(self, s: Sample) -> bool:
+        """The kiln is lower now than it was a minute ago."""
+        past = self._past_temp(s.now, FALLING_WINDOW_S)
+        return past is not None and past - s.temp > FALLING_MIN_C
+
     def _over_target(self, s: Sample):
+        if self.glitch:  # a glitch neither starts nor clears the timer
+            return None
         limit = self.cfg.over_target
+        # With the heater off and the kiln falling, a stop achieves nothing: the kiln is
+        # cooling toward a target that is frozen below it (a warm kiln at the start of a
+        # run). A stuck relay makes the kiln rise instead, and heater_off_rising and
+        # peak_ceiling still cover that.
+        exempt = s.duty <= 0 and self._cooling(s)
         over = (
             limit > 0
             and s.state == "RUNNING"
             and s.temp > s.target + limit
             and not self._skip_over_target(s)
+            and not exempt
         )
         held = self._held("over_target", over, s.now)
         if held is not None and held > self.cfg.over_target_s:
@@ -347,11 +391,7 @@ class Supervisor:
         held = self._held("heater_off", limit > 0 and s.duty <= 0.001, s.now)
         if held is None or held < limit or self.glitch:
             return None
-        past = None  # the newest sample at least STUCK_RISE_WINDOW_S old
-        for t, temp in self.sample_hist:
-            if s.now - t < STUCK_RISE_WINDOW_S:
-                break
-            past = temp
+        past = self._past_temp(s.now, STUCK_RISE_WINDOW_S)
         if past is None or s.temp - past < self.cfg.stuck_rise:
             return None
         return Verdict(
@@ -371,9 +411,15 @@ class Supervisor:
             return None
         mean_duty = sum(duty for _, _, duty in hist) / len(hist)
         gain = s.temp - hist[0][1]
+        # While the controller is catching up it freezes the schedule as soon as the kiln is
+        # one PID window behind, so a stalled kiln sits about one window below the target:
+        # under a small window that is less than plateau_min_below_target.
+        below = s.temp < s.target - self.cfg.plateau_min_below_target or (
+            s.catching_up and s.temp < s.target
+        )
         stalled = (
             s.state == "RUNNING"
-            and s.temp < s.target - self.cfg.plateau_min_below_target
+            and below
             and s.now - hist[0][0] >= window * PLATEAU_WINDOW_FRACTION
             and mean_duty >= self.cfg.plateau_min_duty
             and gain < self.cfg.plateau_gain
@@ -401,7 +447,7 @@ class Supervisor:
                 self._clear_plateau()
                 return None
         held = s.now - self.plateau_at
-        if held >= self.cfg.plateau_hold_s:
+        if stalled and held >= self.cfg.plateau_hold_s:  # not on a lapse sample
             return Verdict(
                 "stop",
                 "plateau",

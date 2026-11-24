@@ -8,8 +8,16 @@ import config
 from lib.supervisor import OK, Sample, Supervisor, SupervisorConfig
 
 
-def sample(now, temp, target, duty=0.0, state="RUNNING", peak=850.0):
-    return Sample(now=now, temp=temp, target=target, duty=duty, state=state, peak=peak)
+def sample(now, temp, target, duty=0.0, state="RUNNING", peak=850.0, catching_up=False):
+    return Sample(
+        now=now,
+        temp=temp,
+        target=target,
+        duty=duty,
+        state=state,
+        peak=peak,
+        catching_up=catching_up,
+    )
 
 
 def run(sup, rows):
@@ -239,8 +247,9 @@ def test_sustained_low_reading_is_not_ignored():
     first = _first_stop(verdicts)
     assert first is not None
     assert verdicts[first].rule == "below_target"
-    # three samples are ignored, the fourth starts the 600 s timer
-    assert 700 < first * 2 <= 712
+    # three samples are ignored, the fourth (t=106) starts the 600 s timer, which trips
+    # after 600 s: without the glitch filter the timer starts at t=100 and trips at 702
+    assert first * 2 == 708
 
 
 def test_believed_jump_after_long_heating_does_not_trip_no_rise():
@@ -319,11 +328,16 @@ def test_not_a_plateau_at_low_duty():
 
 
 def test_first_sample_at_full_duty_is_harmless():
-    # the PID has not settled: the first sample reads 2.0 s of 2 s, then a normal ramp
+    # a flat stall at 89% output with a first sample at 100% (the PID has not settled): the
+    # mean over the window stays under 0.9, so the first sample must not make a plateau
     sup = make()
-    rows = [sample(0, 20.0, 20.0, duty=1.0)]
-    rows += [sample(t, 20 + 0.1 * t, 20 + 0.1 * t + 10, duty=0.6) for t in range(2, 2400, 2)]
-    assert all(v == OK for v in run(sup, rows))
+    rows = [sample(0, 862.0, 870.0, duty=1.0)]
+    rows += _flat_rows(2, 2400, temp=862.0, duty=0.89)
+    verdicts = run(sup, rows)
+    assert all(v == OK for v in verdicts), [v for v in verdicts if v != OK][:1]
+    # the first sample is still in the window while the span is long enough to judge
+    assert sup.plateau_hist[0][0] > 0
+    assert sum(d for _, _, d in sup.plateau_hist) / len(sup.plateau_hist) < 0.9
 
 
 def test_low_glitch_does_not_create_a_plateau():
@@ -384,19 +398,26 @@ def test_plateau_hold_survives_flicker_across_the_margin():
     ]
     verdicts = run(sup, rows)
     assert [v.action for v in verdicts].count("plateau") == 1
-    assert _stop_times(verdicts)[0] == 1140 + 1800
-    assert verdicts[(1140 + 1800) // 2].rule == "plateau"
+    # the hold ends at 2940, a sample inside the flicker's lapse; the stop waits for the next
+    # stalled sample
+    assert _stop_times(verdicts)[0] == 1140 + 1800 + 2
+    assert verdicts[(1140 + 1800 + 2) // 2].rule == "plateau"
 
 
 def test_plateau_hold_survives_a_short_dip_in_mean_duty():
-    # mean duty sits just over 0.9; six samples at 0.85 push it just under for a few
-    # samples, then three at full power bring it back
+    # mean duty sits just over 0.9; six samples at 0.80 push it well under for a while (about
+    # 0.6 of duty-seconds below the 0.3 the margin allows), then six at full power bring it back
     sup = make()
     rows = _flat_rows(0, 1200, duty=0.9005)
     for t in range(1200, 3200, 2):
-        duty = 0.85 if 1200 <= t < 1212 else (1.0 if t < 1218 else 0.9005)
+        duty = 0.80 if 1200 <= t < 1212 else (1.0 if t < 1224 else 0.9005)
         rows.append(sample(t, 864.0, 870.0, duty=duty))
-    verdicts = run(sup, rows)
+    lapsed = False
+    verdicts = []
+    for row in rows:
+        verdicts.append(sup.evaluate(row))
+        lapsed = lapsed or sup.plateau_lapse_at is not None
+    assert lapsed  # the dip really took the stall away for a moment
     assert [v.action for v in verdicts].count("plateau") == 1
     assert _stop_times(verdicts)[0] == 1140 + 1800
 
@@ -414,6 +435,117 @@ def test_plateau_hold_restarts_after_a_real_recovery():
     assert _stop_times(verdicts)[0] == 1632 + 1800
 
 
+def test_plateau_does_not_stop_on_a_lapse_sample_at_hold_expiry():
+    # detected at 1140, the hold ends at 2940; the sample at 2940 reads 3 C under the target
+    # (not stalled now), the next one is stalled again
+    sup = make()
+    rows = _flat_rows(0, 2940)
+    rows.append(sample(2940, 867.0, 870.0, duty=1.0))
+    rows += _flat_rows(2942, 3000)
+    verdicts = run(sup, rows)
+    assert _first_index(verdicts, "plateau") * 2 == 1140
+    assert _stop_times(verdicts)[0] == 2942
+    assert verdicts[2940 // 2] == OK
+
+
+def test_plateau_is_found_under_a_small_pid_window_while_catching_up():
+    # the schedule is frozen one window behind the kiln (2.8 C here), so a stalled kiln never
+    # gets the 4 C below the target the plain rule asks for
+    sup = make()
+    rows = [sample(t, 867.2, 870.0, duty=1.0, catching_up=True) for t in range(0, 3200, 2)]
+    verdicts = run(sup, rows)
+    detected = _first_index(verdicts, "plateau") * 2
+    assert 1140 <= detected <= 1200
+    assert _stop_times(verdicts)[0] == detected + 1800
+    assert verdicts[_stop_times(verdicts)[0] // 2].rule == "plateau"
+
+
+def test_small_gap_without_catch_up_is_not_a_plateau():
+    sup = make()
+    rows = [sample(t, 867.2, 870.0, duty=1.0, catching_up=False) for t in range(0, 3200, 2)]
+    assert all(v == OK for v in run(sup, rows))
+
+
+def test_catching_up_does_not_make_a_kiln_at_the_target_a_plateau():
+    # at or over the target there is nothing to catch up to
+    sup = make()
+    rows = [sample(t, 870.0, 870.0, duty=1.0, catching_up=True) for t in range(0, 3200, 2)]
+    assert all(v == OK for v in run(sup, rows))
+
+
+def _cooling_rows(start_c, per_min, target, until, duty=0.0):
+    return [
+        sample(t, start_c - per_min * t / 60, target, duty=duty, peak=1000.0)
+        for t in range(0, until, 2)
+    ]
+
+
+def test_over_target_ignores_a_kiln_cooling_toward_a_frozen_target_with_the_heater_off():
+    # a warm kiln at 200 C, heater off, cooling 1 C/min, the profile starts at 20 C
+    sup = make()
+    assert all(v == OK for v in run(sup, _cooling_rows(200.0, 1.0, 20.0, 1200)))
+
+
+def test_over_target_still_stops_a_kiln_over_target_with_the_heater_off_and_not_falling():
+    for per_min in (0.0, -1.0):  # flat, then rising (a stuck relay)
+        sup = make()
+        verdicts = run(sup, _cooling_rows(230.0, per_min, 200.0, 400))
+        first = _first_stop(verdicts)
+        assert first is not None, per_min
+        assert verdicts[first].rule == "over_target"
+        assert 120 < first * 2 <= 124
+
+
+def test_over_target_heater_on_still_stops_a_cooling_kiln_with_the_heater_on():
+    sup = make()
+    verdicts = run(sup, _cooling_rows(230.0, 1.0, 200.0, 400, duty=0.5))
+    first = _first_stop(verdicts)
+    assert verdicts[first].rule == "over_target_heater_on"
+    assert 20 < first * 2 <= 24
+
+
+def test_over_target_timer_clears_while_the_kiln_is_exempt():
+    # 30 C over and flat for 100 s (timer running), cooling for 120 s (exempt: timer cleared),
+    # then flat again: the 120 s are counted from the new start, not from t=0
+    sup = make()
+    rows = [sample(t, 230.0, 200.0, peak=1000.0) for t in range(0, 100, 2)]
+    rows += [sample(t, 230.0 - (t - 98) / 60 * 2, 200.0, peak=1000.0) for t in range(100, 220, 2)]
+    flat = 230.0 - 122 / 60 * 2
+    rows += [sample(t, flat, 200.0, peak=1000.0) for t in range(220, 500, 2)]
+    verdicts = run(sup, rows)
+    stop = _stop_times(verdicts)[0]
+    assert verdicts[stop // 2].rule == "over_target"
+    # not stopped before the new timer's 120 s; the fall must be 60 s old before it counts
+    assert stop > 220 + 120 - 2
+
+
+def test_a_glitch_does_not_clear_the_over_target_timers():
+    # 30 C over and flat; a three-sample low reading in the middle must not restart the timer
+    steady = [sample(t, 530.0, 500.0, duty=0.0, peak=1000.0) for t in range(0, 300, 2)]
+    clean = _stop_times(run(make(), steady))[0]
+    glitched = [
+        sample(t, 2.85 if 60 <= t <= 64 else 530.0, 500.0, duty=0.0, peak=1000.0)
+        for t in range(0, 300, 2)
+    ]
+    assert _stop_times(run(make(), glitched))[0] == clean
+
+    steady = [sample(t, 515.0, 500.0, duty=0.5, peak=1000.0) for t in range(0, 100, 2)]
+    clean = _stop_times(run(make(), steady))[0]
+    glitched = [
+        sample(t, 2.85 if 10 <= t <= 14 else 515.0, 500.0, duty=0.5, peak=1000.0)
+        for t in range(0, 100, 2)
+    ]
+    assert _stop_times(run(make(), glitched))[0] == clean
+
+
+def test_a_glitch_does_not_clear_the_peak_ceiling_count():
+    sup = make()
+    rows = [sample(0, 881, 800), sample(2, 2.85, 800), sample(4, 881, 800)]
+    verdicts = run(sup, rows)
+    assert verdicts[:2] == [OK, OK]
+    assert verdicts[2].rule == "peak_ceiling"
+
+
 # ---- SupervisorConfig.from_config ------------------------------------------------
 
 
@@ -424,6 +556,32 @@ def _cfg(**settings):
 def test_from_config_returns_none_when_disabled_or_missing():
     assert SupervisorConfig.from_config(_cfg()) is None
     assert SupervisorConfig.from_config(_cfg(supervisor_enabled=False)) is None
+
+
+@pytest.mark.parametrize("value", ["False", "True", "", 1, 0, None])
+def test_from_config_needs_a_real_bool_to_turn_on(value):
+    assert SupervisorConfig.from_config(_cfg(supervisor_enabled=value)) is None
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "supervisor_over_target_seconds",
+        "supervisor_over_target_heater_on_seconds",
+        "supervisor_below_target_minutes",
+        "supervisor_stuck_minutes",
+        "supervisor_no_rise_minutes",
+        "supervisor_plateau_minutes",
+        "supervisor_plateau_hold_minutes",
+        "supervisor_peak_margin",
+        "supervisor_over_target",
+        "supervisor_plateau_gain",
+    ],
+)
+@pytest.mark.parametrize("bad", ["10", True, [10], float("nan")])
+def test_from_config_rejects_a_bad_number_at_build_time(setting, bad):
+    with pytest.raises((TypeError, ValueError)):
+        SupervisorConfig.from_config(_cfg(supervisor_enabled=True, **{setting: bad}))
 
 
 def test_from_config_uses_the_script_values_when_no_rule_is_set():
