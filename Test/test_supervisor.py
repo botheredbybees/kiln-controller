@@ -1,5 +1,10 @@
 """Tests for the firing supervisor: pure rules over a stream of samples."""
 
+import types
+
+import pytest
+
+import config
 from lib.supervisor import OK, Sample, Supervisor, SupervisorConfig
 
 
@@ -406,3 +411,95 @@ def test_plateau_hold_restarts_after_a_real_recovery():
     assert plateaus == [1140, 1632]
     assert _stop_times(verdicts) == [1632 + 1800 + 2 * k for k in range(len(_stop_times(verdicts)))]
     assert _stop_times(verdicts)[0] == 1632 + 1800
+
+
+# ---- SupervisorConfig.from_config ------------------------------------------------
+
+
+def _cfg(**settings):
+    return types.SimpleNamespace(**settings)
+
+
+def test_from_config_returns_none_when_disabled_or_missing():
+    assert SupervisorConfig.from_config(_cfg()) is None
+    assert SupervisorConfig.from_config(_cfg(supervisor_enabled=False)) is None
+
+
+def test_from_config_uses_the_script_values_when_no_rule_is_set():
+    # an older config.py that only turns the supervisor on
+    got = SupervisorConfig.from_config(_cfg(supervisor_enabled=True))
+    assert got == SupervisorConfig()
+
+
+def test_from_config_converts_display_deltas_to_celsius(monkeypatch):
+    monkeypatch.setattr(config, "temp_scale", "f")
+    got = SupervisorConfig.from_config(
+        _cfg(
+            supervisor_enabled=True,
+            supervisor_peak_margin=54,
+            supervisor_below_target_minutes=10,
+            supervisor_stuck_minutes=12,
+            supervisor_plateau_hold_minutes=30,
+            supervisor_over_target_seconds=120,
+        )
+    )
+    assert got.peak_margin == pytest.approx(30.0)
+    assert got.below_target_s == 600
+    assert got.stuck_s == 720
+    assert got.plateau_hold_s == 1800
+    assert got.over_target_s == 120  # seconds are not scaled
+
+
+def test_from_config_keeps_celsius_deltas_in_a_celsius_config(monkeypatch):
+    monkeypatch.setattr(config, "temp_scale", "c")
+    got = SupervisorConfig.from_config(_cfg(supervisor_enabled=True, supervisor_peak_margin=30))
+    assert got.peak_margin == pytest.approx(30.0)
+
+
+def test_from_config_reads_every_setting_into_its_field(monkeypatch):
+    monkeypatch.setattr(config, "temp_scale", "c")
+    got = SupervisorConfig.from_config(
+        _cfg(
+            supervisor_enabled=True,
+            supervisor_peak_margin=1,
+            supervisor_over_target_heater_on=2,
+            supervisor_over_target_heater_on_seconds=3,
+            supervisor_over_target=4,
+            supervisor_over_target_seconds=5,
+            supervisor_below_target=6,
+            supervisor_below_target_minutes=7,
+            supervisor_max_rise_per_minute=8,
+            supervisor_stuck_minutes=9,
+            supervisor_stuck_rise=10,
+            supervisor_no_rise_minutes=11,
+            supervisor_no_rise_gain=12,
+            supervisor_plateau_minutes=13,
+            supervisor_plateau_gain=14,
+            supervisor_plateau_hold_minutes=15,
+            kiln_must_catch_up=False,
+        )
+    )
+    assert (got.peak_margin, got.over_target_heater_on, got.over_target_heater_on_s) == (1, 2, 3)
+    assert (got.over_target, got.over_target_s, got.below_target) == (4, 5, 6)
+    assert (got.below_target_s, got.max_rise_per_minute, got.stuck_s) == (420, 8, 540)
+    assert (got.stuck_rise, got.no_rise_s, got.no_rise_gain) == (10, 660, 12)
+    assert (got.plateau_window_s, got.plateau_gain, got.plateau_hold_s) == (780, 14, 900)
+    assert got.catch_up_enabled is False
+
+
+def test_from_config_follows_kiln_must_catch_up():
+    assert SupervisorConfig.from_config(_cfg(supervisor_enabled=True)).catch_up_enabled is True
+    on = _cfg(supervisor_enabled=True, kiln_must_catch_up=True)
+    assert SupervisorConfig.from_config(on).catch_up_enabled is True
+
+
+def test_from_config_zero_disables_a_rule(monkeypatch):
+    monkeypatch.setattr(config, "temp_scale", "f")
+    got = SupervisorConfig.from_config(_cfg(supervisor_enabled=True, supervisor_over_target=0))
+    assert got.over_target == 0
+    sup = Supervisor(got)
+    rows = [sample(t, 576.0, 550.0) for t in range(0, 301, 2)]  # 26 C over, heater off
+    assert all(v == OK for v in run(sup, rows))
+    # the same input with the rule on does trip, so the zero is what silences it
+    sup = Supervisor(SupervisorConfig.from_config(_cfg(supervisor_enabled=True)))
+    assert any(v.rule == "over_target" for v in run(sup, rows))

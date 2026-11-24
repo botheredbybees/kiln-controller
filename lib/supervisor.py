@@ -3,6 +3,8 @@
 The oven feeds one Sample per control tick to Supervisor.evaluate, which returns a
 Verdict. Units here are degrees C and seconds; duty is 0 to 1. This module imports
 nothing from the oven, the GPIO layer or config, so it can be tested on its own.
+SupervisorConfig.from_config is the one place the settings are read; it takes the
+settings module as an argument.
 
 A rule that says "for N seconds" starts a timer at the first sample over its limit and
 trips when a later sample is still over the limit more than N seconds on. The ceiling
@@ -85,6 +87,51 @@ class SupervisorConfig:
     plateau_min_duty: float = 0.9
     plateau_min_below_target: float = 4.0
     catch_up_enabled: bool = True  # the controller's kiln_must_catch_up
+
+    @classmethod
+    def from_config(cls, cfg):
+        """Build a config from the settings module, or None when supervision is off.
+
+        Settings that are temperature deltas are in the display scale and are converted to C
+        here; minutes become seconds. A setting an older config.py does not have keeps the
+        script value, so this reads every setting with getattr and never raises for a missing one.
+        """
+        if not getattr(cfg, "supervisor_enabled", False):
+            return None
+        from temp import delta_to_c  # lazy: lib.temp reads config, this module stays pure
+
+        d = cls()
+
+        def read(name, default, convert=lambda v: v):
+            value = getattr(cfg, "supervisor_" + name, None)
+            return default if value is None else convert(value)
+
+        def delta(name, default):
+            return read(name, default, delta_to_c)
+
+        def minutes(name, default):
+            return read(name, default, lambda v: v * 60)
+
+        return cls(
+            peak_margin=delta("peak_margin", d.peak_margin),
+            over_target_heater_on=delta("over_target_heater_on", d.over_target_heater_on),
+            over_target_heater_on_s=read(
+                "over_target_heater_on_seconds", d.over_target_heater_on_s
+            ),
+            over_target=delta("over_target", d.over_target),
+            over_target_s=read("over_target_seconds", d.over_target_s),
+            below_target=delta("below_target", d.below_target),
+            below_target_s=minutes("below_target_minutes", d.below_target_s),
+            max_rise_per_minute=delta("max_rise_per_minute", d.max_rise_per_minute),
+            stuck_s=minutes("stuck_minutes", d.stuck_s),
+            stuck_rise=delta("stuck_rise", d.stuck_rise),
+            no_rise_s=minutes("no_rise_minutes", d.no_rise_s),
+            no_rise_gain=delta("no_rise_gain", d.no_rise_gain),
+            plateau_window_s=minutes("plateau_minutes", d.plateau_window_s),
+            plateau_gain=delta("plateau_gain", d.plateau_gain),
+            plateau_hold_s=minutes("plateau_hold_minutes", d.plateau_hold_s),
+            catch_up_enabled=getattr(cfg, "kiln_must_catch_up", True),
+        )
 
 
 class Supervisor:

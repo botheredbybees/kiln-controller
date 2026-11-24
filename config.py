@@ -274,6 +274,30 @@ catch_up_stalled_minutes = 15  # minutes behind schedule before alerting
 alert_webhook_timeout = 10  # seconds before giving up on a webhook post
 
 ########################################################################
+# firing supervisor - stops a firing that is behaving unsafely, using
+# rules that look at the whole run rather than one reading. see
+# lib/supervisor.py. it raises the supervisor_stop and supervisor_plateau
+# alerts. temperature settings are deltas in the display scale (the C
+# value is in each comment), minutes and seconds are as named. setting a
+# rule's main number to 0 turns that rule off.
+supervisor_enabled = False
+supervisor_peak_margin = 54  # stop this far above the profile's highest point (30 C)
+supervisor_over_target_heater_on = 18  # over target with the elements on (10 C) ...
+supervisor_over_target_heater_on_seconds = 20  # ... for this long
+supervisor_over_target = 45  # over target even with the elements off (25 C) ...
+supervisor_over_target_seconds = 120  # ... for this long
+supervisor_below_target = 72  # below target (40 C) ...
+supervisor_below_target_minutes = 10  # ... for this long
+supervisor_max_rise_per_minute = 54  # rising faster than this with the elements on (30 C/min)
+supervisor_stuck_minutes = 12  # elements off this long and still rising ...
+supervisor_stuck_rise = 11  # ... by this much over the last 6 minutes (6 C)
+supervisor_no_rise_minutes = 10  # elements on this long while the target rises, with less ...
+supervisor_no_rise_gain = 5  # ... than this gained since the run began (3 C)
+supervisor_plateau_minutes = 20  # kiln at full power below target and gaining less ...
+supervisor_plateau_gain = 9  # ... than this over the window (5 C) is a plateau
+supervisor_plateau_hold_minutes = 30  # a plateau that lasts this long stops the firing
+
+########################################################################
 # automatic restarts - if you have a power brown-out and the raspberry pi
 # reboots, this restarts your kiln where it left off in the firing profile.
 # This only happens if power comes back before automatic_restart_window
