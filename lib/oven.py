@@ -9,6 +9,7 @@ import digitalio
 import adafruit_bitbangio as bitbangio
 import statistics
 from temp import to_c, to_display, delta_to_c, delta_to_display, display_pidstats
+from supervisor import Sample, Supervisor, SupervisorConfig
 
 log = logging.getLogger(__name__)
 
@@ -459,6 +460,12 @@ class Oven(threading.Thread):
         # check_catch_up_stalled); reset ends any measured episode
         self.catch_up_since = None
         self.catch_up_alerted = False
+        # the firing supervisor is built lazily, once per run; reset() ends it
+        # (see supervisor_check). reset() runs from __init__, so these are plain
+        # assignments that need nothing else to exist yet.
+        self._supervisor = None
+        self._supervisor_peak = 0
+        self._supervisor_failed = False
 
     @staticmethod
     def get_start_from_temperature(profile, temp):
@@ -780,6 +787,66 @@ class Oven(threading.Thread):
                 minutes=config.catch_up_stalled_minutes,
                 profile=self.profile.name if self.profile else None,
             )
+
+    def supervisor_check(self):
+        """run the firing supervisor over this tick's reading. it stops the run when a
+        rule trips and alerts when the kiln stalls below its target. an error in the
+        supervisor is logged once per run and ignored (fail open): it must never stop
+        the control loop, and the checks in reset_if_emergency stay in force."""
+        verdict = None
+        try:
+            if self.profile is None or self.state not in ("RUNNING", "PAUSED"):
+                return  # reset_if_emergency may have just ended the run
+            if self._supervisor is None:
+                cfg = SupervisorConfig.from_config(config)
+                if cfg is None:
+                    return
+                self._supervisor_peak = max(y for (_, y) in self.profile.data)
+                self._supervisor = Supervisor(cfg)
+                if not cfg.catch_up_enabled:
+                    log.warning(
+                        "supervisor: kiln_must_catch_up is off, so the over-target rules "
+                        "are skipped while the target is falling"
+                    )
+            temp = self._current_temp()
+            if temp is None:
+                return
+            duty = self.heat / self.time_step if self.time_step > 0 else 0.0
+            verdict = self._supervisor.evaluate(
+                Sample(
+                    now=time.time(),
+                    temp=temp,
+                    target=self.target,
+                    duty=min(max(duty, 0.0), 1.0),
+                    state=self.state,
+                    peak=self._supervisor_peak,
+                )
+            )
+            if verdict.action == "plateau":
+                self._emit(
+                    "supervisor_plateau",
+                    temperature=to_display(temp),
+                    target=to_display(self.target),
+                    minutes=round(self._supervisor.cfg.plateau_window_s / 60),
+                    reason=verdict.reason,
+                    profile=self.profile.name,
+                )
+            elif verdict.action == "stop":
+                log.error("supervisor stopping the firing: %s" % (verdict.reason))
+                self._emit(
+                    "supervisor_stop",
+                    rule=verdict.rule,
+                    reason=verdict.reason,
+                    temperature=to_display(temp),
+                    profile=self.profile.name,
+                )
+        except Exception as e:
+            if not self._supervisor_failed:
+                self._supervisor_failed = True
+                log.error("supervisor error, supervision skipped: %s" % (e))
+            return
+        if verdict.action == "stop":
+            self.abort_run(reason="supervisor: " + verdict.rule)
 
     def check_cooled_safe(self):
         """fire and disarm the armed cooled_safe alert once the kiln has
@@ -1188,6 +1255,7 @@ class Oven(threading.Thread):
             self.save_automatic_restart_state()
             self.heat_then_cool()
             self.reset_if_emergency()
+            self.supervisor_check()
             self.reset_if_schedule_ended()
             self.check_safety_detectors()
             return
@@ -1199,6 +1267,7 @@ class Oven(threading.Thread):
             self.update_target_temp()
             self.heat_then_cool()
             self.reset_if_emergency()
+            self.supervisor_check()
             self.reset_if_schedule_ended()
             self.check_safety_detectors()
             self.check_catch_up_stalled()
