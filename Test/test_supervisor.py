@@ -503,3 +503,118 @@ def test_from_config_zero_disables_a_rule(monkeypatch):
     # the same input with the rule on does trip, so the zero is what silences it
     sup = Supervisor(SupervisorConfig.from_config(_cfg(supervisor_enabled=True)))
     assert any(v.rule == "over_target" for v in run(sup, rows))
+
+
+# Cases ported from selftest() in tools/kiln-supervisor/profile_monitor.py. Each one rebuilds the
+# script's constructed sequence as Samples (the script's `heat` tuple value is already a 0 to 1
+# duty) and expects the same rule to trip, or the same silence. The script ran its plateau
+# ("cannot reach the target") rule as a stop; here it first reports "plateau" and stops after the
+# hold, so that case expects the plateau verdict and then the stop.
+#
+# Not ported, because the rule is not in lib/supervisor.py:
+#   - absolute ceiling, twice in a row (script 1051 C): the oven's own emergency_shutoff_temp does it
+#   - one reading over the absolute ceiling stays quiet
+#   - run length past the profile length plus the allowance, and the same with a long allowance
+#   - a normal cool-down after the run (state IDLE): the oven never calls the supervisor in IDLE
+#   - the two status-feed reconnect cases (a laptop concern, there is no feed here)
+def _script_ramp(n, c0=22.0, per_step=0.17, duty=1.0, peak=150.0):
+    return [
+        sample(i * 2, c0 + i * per_step, c0 + i * per_step, duty=duty, peak=peak) for i in range(n)
+    ]
+
+
+def _script_cases():
+    cases = []
+
+    def add(name, rows, expect):
+        cases.append(pytest.param(rows, expect, id=name))
+
+    add("healthy_ramp", _script_ramp(400), None)
+    hold = [
+        sample(i * 2, 150.0, 150.0, duty=1.0 if i % 3 == 0 else 0.0, peak=150.0) for i in range(300)
+    ]
+    add("healthy_hold", hold, None)
+    swing = [
+        sample(i * 2, 150.0 + (4 if i % 20 < 10 else -4), 150.0, peak=150.0) for i in range(300)
+    ]
+    add("small_swings_around_the_target", swing, None)
+    over_heat = [sample(i * 2, 165.0, 150.0, duty=1.0, peak=150.0) for i in range(20)]
+    add("heater_on_well_above_target", over_heat, ("stop", "over_target_heater_on"))
+    over_any = [sample(i * 10, 178.0, 150.0, peak=200.0) for i in range(20)]
+    add("sustained_overshoot", over_any, ("stop", "over_target"))
+    lag = [sample(i * 30, 60.0, 150.0, duty=1.0, peak=150.0) for i in range(30)]
+    add("sustained_lag", lag, ("stop", "below_target"))
+    fast = [sample(i * 2, 22 + i * 1.2, 150.0, duty=1.0, peak=300.0) for i in range(60)]
+    add("runaway_rate", fast, ("stop", "rise_rate"))
+    # target rising, reading dead flat
+    stuck = [sample(i * 2, 22.0, 22.0 + i * 0.05, duty=1.0, peak=150.0) for i in range(400)]
+    add("no_rise_while_the_target_rises", stuck, ("stop", "no_rise"))
+    # far below target: the lag rule catches it first
+    stuck_far = [sample(i * 2, 22.0, 150.0, duty=1.0, peak=150.0) for i in range(400)]
+    add("stuck_reading_far_below_target", stuck_far, ("stop", "below_target"))
+    peak_over = [sample(0, 190.0, 150.0, peak=150.0), sample(2, 191.0, 150.0, peak=150.0)]
+    add("above_the_peak_plus_margin_twice", peak_over, ("stop", "peak_ceiling"))
+    one_high = [sample(0, 190.0, 150.0, peak=150.0), sample(2, 150.0, 150.0, peak=150.0)]
+    add("one_bad_high_reading", one_high, None)
+    # a controlled cool-down: target falling, heater cycling to slow it, reading falling 1 C/min
+    cool_run = [
+        sample(
+            i * 10,
+            900.0 - i * (10 / 60),
+            900.0 - i * (10 / 60) + 1.0,
+            duty=0.3 if i % 2 else 0.0,
+            peak=1000.0,
+        )
+        for i in range(1080)
+    ]
+    add("controlled_cool_down_with_the_heater_cycling", cool_run, None)
+    # at the top of the ramp: heater off for 4 minutes while the kiln coasts up 20 C, then falls
+    coast = [
+        sample(
+            i * 2,
+            1000.0 + (min(i, 60) * 0.33 if i <= 60 else 20.0 - (i - 60) * 0.1),
+            1000.0,
+            duty=0.0 if i > 5 else 0.5,
+            peak=1000.0,
+        )
+        for i in range(240)
+    ]
+    add("short_coast_after_the_heater_goes_off", coast, None)
+    # 25 min at full power, flat, 20 C below the target
+    stall = [sample(i * 10, 700.0 + i * 0.001, 720.0, duty=1.0, peak=1000.0) for i in range(150)]
+    add("full_power_with_no_gain_below_target", stall, ("plateau", "plateau"))
+    # gaining 1.2 C/min at full power, 6 C behind (the controller holds the schedule near the kiln)
+    slow = [
+        sample(i * 10, 700.0 + i * 0.2, 706.0 + i * 0.2, duty=1.0, peak=1000.0) for i in range(150)
+    ]
+    add("slow_climb_at_full_power", slow, None)
+    # heater reported off, +1 C/min for 33 min
+    stuck_on = [sample(i * 5, 300.0 + i * (1 / 12), 290.0, peak=1000.0) for i in range(400)]
+    add("temperature_rising_with_the_heater_off", stuck_on, ("stop", "heater_off_rising"))
+    # the script's IDLE case: the supervisor only sees RUNNING or PAUSED, so it runs as PAUSED
+    stuck_paused = [
+        sample(i * 5, 300.0 + i * (1 / 12), 0, state="PAUSED", peak=1000.0) for i in range(400)
+    ]
+    add("temperature_rising_while_paused", stuck_paused, ("stop", "heater_off_rising"))
+    return cases
+
+
+@pytest.mark.parametrize("rows, expect", _script_cases())
+def test_script_cases_are_ported(rows, expect):
+    sup = make()
+    verdicts = run(sup, rows)
+    if expect is None:
+        assert all(v == OK for v in verdicts), [v for v in verdicts if v != OK][:1]
+        return
+    action, rule = expect
+    first = next((v for v in verdicts if v != OK), None)
+    assert first is not None, "no rule tripped"
+    assert (first.action, first.rule) == (action, rule), first
+    if action == "plateau":
+        # the script stopped here; the supervisor stops after the 30 minute hold
+        more = [rows[-1].now + 10 * (k + 1) for k in range(200)]
+        tail = run(
+            sup, [sample(t, rows[-1].temp, rows[-1].target, duty=1.0, peak=1000.0) for t in more]
+        )
+        stop = next(v for v in tail if v.action == "stop")
+        assert stop.rule == "plateau"
