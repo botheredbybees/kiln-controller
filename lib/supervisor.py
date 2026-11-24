@@ -394,7 +394,9 @@ class Supervisor:
         if stalled:
             self.plateau_lapse_at = None
         else:
-            self.plateau_lapse_at = s.now if self.plateau_lapse_at is None else self.plateau_lapse_at
+            self.plateau_lapse_at = (
+                s.now if self.plateau_lapse_at is None else self.plateau_lapse_at
+            )
             if s.now - self.plateau_lapse_at > PLATEAU_LAPSE_S:
                 self._clear_plateau()
                 return None

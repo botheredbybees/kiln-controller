@@ -104,10 +104,7 @@ def test_state_change_clears_windows():
 
 def _falling_target_rows(n_s):
     # the target falls 0.5 C per 2 s; the kiln stays 30 C above it with the heater on
-    return [
-        sample(t, 700 - 0.25 * t + 30, 700 - 0.25 * t, duty=1.0)
-        for t in range(0, n_s + 1, 2)
-    ]
+    return [sample(t, 700 - 0.25 * t + 30, 700 - 0.25 * t, duty=1.0) for t in range(0, n_s + 1, 2)]
 
 
 def test_over_target_rules_skip_a_falling_target_without_catch_up():
@@ -354,9 +351,13 @@ def test_high_glitch_does_not_clear_a_plateau():
 def test_clock_stepping_backwards_resets_windows():
     sup = make()
     start = 10000
-    assert all(v == OK for v in run(sup, [sample(start + t, 800, 805, duty=1.0) for t in range(600)]))
+    assert all(
+        v == OK for v in run(sup, [sample(start + t, 800, 805, duty=1.0) for t in range(600)])
+    )
     # 15 s of 12 C over with the heater on; the timer is running
-    assert all(v == OK for v in run(sup, [sample(start + 600 + t, 812, 800, duty=0.5) for t in range(15)]))
+    assert all(
+        v == OK for v in run(sup, [sample(start + 600 + t, 812, 800, duty=0.5) for t in range(15)])
+    )
     back = start + 600 - 3600
     assert sup.evaluate(sample(back, 812, 800, duty=0.5)) == OK
     # the 20 s timer starts again from the sample after the step
