@@ -8,6 +8,9 @@ A rule that says "for N seconds" starts a timer at the first sample over its lim
 trips when a later sample is still over the limit more than N seconds on. The ceiling
 rule needs CONSECUTIVE samples in a row.
 
+The heater-off rule trips at 720 s or more (the monitor script's behaviour); the other
+timer rules trip strictly after their time.
+
 Every rule is disabled by setting its main number to 0.
 """
 
@@ -154,6 +157,7 @@ class Supervisor:
             self.heat_hist.clear()
             self.sample_hist.clear()
             self.start_temp = None
+            self.heat_time = 0.0
         self.last_temp = s.temp
         if self.start_temp is None:
             self.start_temp = s.temp

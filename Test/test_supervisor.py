@@ -241,6 +241,23 @@ def test_sustained_low_reading_is_not_ignored():
     assert 700 < first * 2 <= 712
 
 
+def test_believed_jump_after_long_heating_does_not_trip_no_rise():
+    # 580 C ramping at 5 C/min with the target rising and the heater on: past 600 s of
+    # heating time the no-rise rule has a gain to judge. The reading then drops to 2.85 C
+    # and stays there, so after three ignored samples the 4th is believed. The gain is
+    # measured again from that reading, so heating time must restart too: no `no_rise`
+    # stop on that tick. below_target starts its own 600 s timer, far from tripping in
+    # 20 s. The recovery is a second believed jump and must not look like a fast rise.
+    sup = make()
+    rows = []
+    for t in range(0, 770, 2):
+        ramp = 580 + 5 / 60 * t
+        shown = 2.85 if 710 <= t <= 730 else ramp
+        rows.append(sample(t, shown, ramp, duty=0.8))
+    verdicts = run(sup, rows)
+    assert all(v == OK for v in verdicts), [v for v in verdicts if v != OK][:1]
+
+
 def test_heater_and_rate_rules_are_off_when_zero():
     sup = make(max_rise_per_minute=0, stuck_s=0, no_rise_s=0)
     rows = [sample(t, 100 + 0.6 * t, 800, duty=1.0) for t in range(0, 62, 2)]
