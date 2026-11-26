@@ -52,8 +52,22 @@ controller, the SSR and the pin work before the kiln is connected. `ws_status.py
 
 ## bisque-850c.json
 
-The bisque schedule for that kiln (17.7 hours including the cool-down), copy it to the Pi's `storage/profiles`.
+The bisque schedule for that kiln (14.3 hours including the controlled cool-down to 500 C), copy it to the Pi's `storage/profiles`.
 It peaks at 850 C because the kiln could not hold 865 C even at full power. Ramps are what the kiln followed
 with the PID's window held: 31 C/h to 90 C, 200 C/h to 538 C, 120 C/h to 760 C, 80 C/h to 850 C, a
-30 minute hold, then a controlled cool-down (-200, -100, -150, -60 C/h) that slows through quartz inversion
-(573 C) and cristobalite (about 226 C). The controller can only slow cooling by feeding heat, never speed it up.
+30 minute hold, then a controlled cool-down (-200 then -100 C/h) to 500 C that slows through quartz
+inversion (573 C). The profile ends at 500 C and the controller switches the heater off: below that the
+kiln cools more slowly than any schedule worth asking for (the first cool-down never used the heater again
+below 500 C and ran hours behind), and nothing in a bisque matters below quartz inversion. Let the kiln
+cool with the lid shut. The controller can only slow cooling by feeding heat, never speed it up.
+
+## raku.json
+
+Heats bisqued, glazed raku pots to 850 C and stops, so they can be lifted out hot into sawdust (6.5 hours).
+20 to 100 C at 100 C/h, 20 minute hold (drives off damp glaze), 200 C/h to 538 C, 120 C/h to 760 C,
+80 C/h to 850 C, 15 minute hold, then the run ends and the heater goes off. There is no cool-down and no
+hold at 316 or 538 C: the pots are already bisqued. Ramps are the ones the kiln has followed (see
+bisque-850c); raku clay would tolerate faster, so they can be tightened after a first firing. 850 C is the
+top of what this kiln can hold (it plateaus near 865 C at full power), so the glaze must mature at or below
+about 850 C. Not yet fired. The kiln cools about 200 C/h at 860 C once the heater is off, so be ready at the
+kiln before the 15 minute hold ends.
